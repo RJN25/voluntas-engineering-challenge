@@ -339,14 +339,19 @@ impl<E: Exchange> Engine<E> {
         Ok(())
     }
 
-    /// The sibling that holds a book and heard about the symbol most recently.
+    /// The replica whose book holds the newest exchange data (ties broken by
+    /// local receive time).
     fn freshest_replica(&self, shard: usize, symbol: &str) -> Option<usize> {
         self.shards[shard]
             .conns
             .iter()
             .copied()
             .filter(|&c| self.books.contains_key(&(c, symbol.to_owned())))
-            .max_by_key(|&c| self.last_seen.get(&(c, symbol.to_owned())).copied())
+            .max_by_key(|&c| {
+                let key = (c, symbol.to_owned());
+                let exchange_ts = self.books.get(&key).and_then(|b| b.exchange_ts);
+                (exchange_ts, self.last_seen.get(&key).copied())
+            })
     }
 
     fn switch_source(&mut self, symbol: &str, conn: usize) -> anyhow::Result<()> {
@@ -355,8 +360,10 @@ impl<E: Exchange> Engine<E> {
         self.write_snapshot(conn, symbol, Utc::now())
     }
 
-    /// If a sibling heard about a symbol much more recently than its source,
-    /// the source is probably delayed or silently dead: fail over.
+    /// If a sibling's book holds exchange data more than `lag` newer than the
+    /// source's, the source is delayed or silently dead: fail over. Comparing
+    /// exchange time (identical across replicas for the same update) means quiet
+    /// markets and staggered connects never trigger a false failover.
     fn check_lag(&mut self) -> anyhow::Result<()> {
         let mut switches = Vec::new();
         for (symbol, &source) in &self.source {
@@ -366,10 +373,16 @@ impl<E: Exchange> Engine<E> {
             let Some(best) = self.freshest_replica(shard, symbol) else {
                 continue;
             };
-            let seen = |c: usize| self.last_seen.get(&(c, symbol.clone())).copied();
-            if let (Some(best_seen), Some(source_seen)) = (seen(best), seen(source))
+            let ts = |c: usize| {
+                self.books
+                    .get(&(c, symbol.clone()))
+                    .and_then(|b| b.exchange_ts)
+            };
+            if let (Some(best_ts), Some(source_ts)) = (ts(best), ts(source))
                 && best != source
-                && best_seen.duration_since(source_seen) > self.cfg.lag
+                && (best_ts - source_ts)
+                    .to_std()
+                    .is_ok_and(|d| d > self.cfg.lag)
             {
                 switches.push((symbol.clone(), best));
             }
