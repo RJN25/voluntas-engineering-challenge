@@ -88,4 +88,23 @@ Not done, because of the deadline: a fake-exchange integration test (scripted dr
 
 ## Live run
 
-LIVE_RUN_STATS
+A 150-second live run (Oct 27, 2026) was stopped with SIGINT. It exited 0 in under 1s, and the output was fully readable by `AlignedSbeReader`:
+
+```
+symbols:                     78000
+snapshots:                   199484
+price level updates:         1030190
+updates before any snapshot: 0
+crossed-book updates:        6
+non-monotonic exchange ts:   538
+max snapshot gap (s):        60
+recv - exchange latency ms:  p50 24 p90 323 p99 2274
+```
+
+The run peaked at 390 websockets with channel backlog in the low thousands, and it drained.
+
+How to read these numbers:
+- This run used the build *before* the lag-failover fix (commit `9ab6be0`). Its 9,530 failovers are mostly the false positives described above. Every one of them still wrote a correct snapshot, so the data stays consistent, just with extra snapshots.
+- **Non-monotonic timestamps** (0.05%) are expected around source switches. A replica's book can be a few ms behind or ahead, and the switch snapshot re-bases the book.
+- **Crossed updates** (6) are transient states inside a multi-level `price_change` that is applied one level at a time. The `best_bid`/`best_ask` cross-check in next steps would confirm this.
+- The **latency tail** is inflated by the startup burst: 78k subscriptions in about 90s. A steady-state measurement belongs in LATENCY.md.
