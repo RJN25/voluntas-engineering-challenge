@@ -1,66 +1,36 @@
-use chrono::DateTime;
-use engineering_challenge::Side;
-use engineering_challenge::util::dtos::challenge_orderbook::{
-    AnyMessage, PriceLevelUpdateDomain, SnapshotAsksEntryDomain, SnapshotBidsEntryDomain,
-    SnapshotDomain,
-};
-use engineering_challenge::util::{AlignedSbeReader, AlignedSbeWriter, OrderbookSchema};
+mod collector;
 
-const CHUNK_SIZE_64_MEBIBYTES: usize = 64 << 20;
+use std::time::Duration;
 
-/// This is a dummy example where we define a snapshot and price level update,
-/// write them to a file using [`AlignedSbeWriter`], and then read them back
-/// from the same file using [`AlignedSbeReader`], asserting that what we read
-/// back is the exact same as what we wrote.
-///
-/// You should replace this main function with your actual solution, and split
-/// up your code into modules in `src/` in a way that makes sense to you.
-fn main() -> anyhow::Result<()> {
-    let timestamp = DateTime::from_timestamp_micros(1_700_000_000_000_000).unwrap();
-    let symbol = "EXAMPLE".to_owned();
-    let snapshot = SnapshotDomain {
-        received_at: timestamp,
-        exchange_timestamp: timestamp,
-        bids: vec![SnapshotBidsEntryDomain {
-            price_level: 400_000,
-            quantity: 2_000_000,
-        }],
-        asks: vec![SnapshotAsksEntryDomain {
-            price_level: 600_000,
-            quantity: 3_500_000,
-        }],
-        symbol: symbol.clone(),
+use collector::engine::{self, Config};
+use collector::exchange::Exchange;
+use collector::polymarket::Polymarket;
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Logs go to stderr; stdout is reserved for SBE output.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
+
+    let output = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/dev/stdout".into());
+    let cfg = Config {
+        replicas: env_u64("REPLICAS", 2).max(1) as usize,
+        lag: Duration::from_millis(env_u64("LAG_MS", 3000)),
+        snapshot_every: Duration::from_secs(env_u64("SNAPSHOT_SECS", 60)),
+        discover_every: Duration::from_secs(env_u64("DISCOVER_SECS", 60)),
     };
-    let update = PriceLevelUpdateDomain {
-        backtest_timestamp: timestamp,
-        exchange_timestamp: timestamp,
-        price_level: 400_000,
-        quantity: 1_250_000,
-        side: Side::Buy,
-        symbol: symbol.clone(),
-    };
-
-    let file = tempfile::NamedTempFile::new()?;
-    let mut writer = AlignedSbeWriter::create(file.path(), CHUNK_SIZE_64_MEBIBYTES)?;
-    writer.write_msg(&snapshot)?;
-    writer.write_msg(&update)?;
-    writer.flush()?;
-    drop(writer);
-
-    let mut reader = AlignedSbeReader::<OrderbookSchema>::open(file.path())?;
-
-    let Some(AnyMessage::Snapshot(decoded)) = reader.read_msg()? else {
-        anyhow::bail!("expected snapshot");
-    };
-    assert_eq!(SnapshotDomain::try_from_decoder(decoded)?, snapshot);
-
-    let Some(AnyMessage::PriceLevelUpdate(decoded)) = reader.read_msg()? else {
-        anyhow::bail!("expected price level update");
-    };
-    assert_eq!(PriceLevelUpdateDomain::try_from_decoder(decoded)?, update);
-    assert!(reader.read_msg()?.is_none());
-
-    println!("Verification success!");
-
-    Ok(())
+    let exchange = Polymarket::new();
+    let name = exchange.name();
+    tracing::info!(output, replicas = cfg.replicas, exchange = name, "starting");
+    engine::run(exchange, output.as_ref(), cfg).await
 }
